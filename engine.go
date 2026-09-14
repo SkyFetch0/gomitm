@@ -83,6 +83,10 @@ func (e *Engine) Handle(conn net.Conn, host, dst string, isTLS bool) {
 		if err := tlsConn.Handshake(); err != nil {
 			return
 		}
+		if tlsConn.ConnectionState().NegotiatedProtocol == "h2" {
+			e.h2Server(tlsConn, host, dst, hello)
+			return
+		}
 		e.httpLoop(tlsConn, host, dst, true, hello)
 		return
 	}
@@ -131,7 +135,7 @@ func (e *Engine) httpLoop(client net.Conn, host, dst string, tlsUp bool, hello [
 			}
 			resSnip, resN, resTr, resRest := peekBody(mock.Body, e.maxBody)
 			mock.Body = resRest
-			_ = mock.Write(client)
+			_ = writeHTTP11(client, mock)
 			e.emit(host, req, mock.StatusCode, reqN, resN, true, reqSnip, resSnip, reqTr, resTr)
 			continue
 		}
@@ -168,7 +172,7 @@ func (e *Engine) forward(client net.Conn, dst, host string, req *http.Request, t
 	if resN < 0 {
 		resN = peeked
 	}
-	_ = resp.Write(client)
+	_ = writeHTTP11(client, resp)
 	return status, reqN, resN, resSnip, resTr
 }
 

@@ -123,7 +123,7 @@ func (m *CertManager) ServerConfig() *tls.Config {
 			return m.leaf(name)
 		},
 		MinVersion: tls.VersionTLS12,
-		NextProtos: []string{"http/1.1"},
+		NextProtos: []string{"h2", "http/1.1"},
 	}
 }
 
