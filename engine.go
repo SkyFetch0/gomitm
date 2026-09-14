@@ -15,6 +15,7 @@ type Engine struct {
 	ca      *CertManager
 	d       Decider
 	maxBody int64
+	keyLog  io.Writer
 }
 
 func New(ca *CertManager, d Decider) *Engine {
@@ -24,6 +25,19 @@ func New(ca *CertManager, d Decider) *Engine {
 func (e *Engine) WithMaxBody(n int64) *Engine {
 	e.maxBody = n
 	return e
+}
+
+func (e *Engine) WithKeyLog(w io.Writer) *Engine {
+	e.keyLog = w
+	return e
+}
+
+func (e *Engine) serverTLS() *tls.Config {
+	cfg := e.ca.ServerConfig()
+	if e.keyLog != nil {
+		cfg.KeyLogWriter = e.keyLog
+	}
+	return cfg
 }
 
 // Handle processes one accepted connection.
@@ -56,7 +70,8 @@ func (e *Engine) Handle(conn net.Conn, host, dst string, isTLS bool) {
 		return
 	}
 	if isTLS {
-		tlsConn := tls.Server(bc, e.ca.ServerConfig())
+		dumpOriginChain(host, dst)
+		tlsConn := tls.Server(bc, e.serverTLS())
 		if err := tlsConn.Handshake(); err != nil {
 			return
 		}
