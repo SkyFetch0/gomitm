@@ -259,6 +259,11 @@ func (e *Engine) forwardRaw(client net.Conn, br *bufio.Reader, dst, host string,
 	if err := req.Write(up); err != nil {
 		return
 	}
+	kind := "upgrade"
+	if isSSE(req) {
+		kind = "sse"
+	}
+	e.emit(host, req, 101, 0, 0, false, nil, []byte(kind), false, false)
 	errc := make(chan struct{}, 2)
 	go func() { io.Copy(up, br); errc <- struct{}{} }()
 	go func() { io.Copy(client, up); errc <- struct{}{} }()
