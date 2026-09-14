@@ -20,7 +20,7 @@ func peekTLSRecord(br *bufio.Reader) []byte {
 		return nil
 	}
 	n := int(binary.BigEndian.Uint16(h[3:5]))
-	if n < 0 || n > 1<<16-1 {
+	if n > 1<<16-1 {
 		return nil
 	}
 	need := 5 + n
@@ -58,9 +58,12 @@ func (e *Engine) utlsHandshake(raw net.Conn, host string, hello []byte) (net.Con
 		MinVersion:         utls.VersionTLS12,
 	}
 	var spec *utls.ClientHelloSpec
-	if len(hello) >= 5 {
+	if len(hello) >= 9 {
 		fp := &utls.Fingerprinter{AllowBluntMimicry: true}
-		spec, _ = fp.FingerprintClientHello(hello)
+		spec, _ = fp.RawClientHello(hello)
+		if spec == nil && hello[0] == 0x16 {
+			spec, _ = fp.RawClientHello(hello[5:])
+		}
 	}
 	var u *utls.UConn
 	if spec != nil {
@@ -78,15 +81,7 @@ func (e *Engine) utlsHandshake(raw net.Conn, host string, hello []byte) (net.Con
 }
 
 func (e *Engine) writeHTTP(up net.Conn, req *http.Request) (*http.Response, error) {
-	req.RequestURI = ""
-	if req.URL != nil {
-		if req.URL.Scheme == "" {
-			req.URL.Scheme = "https"
-		}
-		if req.URL.Host == "" && req.Host != "" {
-			req.URL.Host = req.Host
-		}
-	}
+	prepReqURL(req)
 	if negotiatedALPN(up) == "h2" {
 		tr := &http2.Transport{}
 		cc, err := tr.NewClientConn(up)
@@ -110,6 +105,9 @@ func writeHTTP11(w io.Writer, resp *http.Response) error {
 	resp.ProtoMinor = 1
 	resp.TransferEncoding = nil
 	resp.Header.Del("Transfer-Encoding")
+	for _, k := range []string{"Connection", "Keep-Alive", "Proxy-Connection", "Upgrade", "TE"} {
+		resp.Header.Del(k)
+	}
 	if resp.Uncompressed {
 		resp.Header.Del("Content-Encoding")
 		resp.Uncompressed = false
@@ -117,85 +115,183 @@ func writeHTTP11(w io.Writer, resp *http.Response) error {
 	return resp.Write(w)
 }
 
-func (e *Engine) h2Server(client *tls.Conn, host, dst string, hello []byte) {
-	up, err := e.dialUpstream(dst, host, true, hello)
-	if err != nil {
-		return
+func (e *Engine) h2Server(client *tls.Conn, sni, dst string, hello []byte) {
+	if dst == "" {
+		dst = net.JoinHostPort(sni, "443")
 	}
-	defer up.Close()
+	shared, err := e.dialUpstream(dst, sni, true, hello)
 	var h2c *http2.ClientConn
-	if negotiatedALPN(up) == "h2" {
+	if err == nil && negotiatedALPN(shared) == "h2" {
 		tr := &http2.Transport{}
-		h2c, err = tr.NewClientConn(up)
+		h2c, err = tr.NewClientConn(shared)
 		if err != nil {
+			shared.Close()
 			h2c = nil
+			shared = nil
 		}
+	} else if shared != nil {
+		shared.Close()
+		shared = nil
+	}
+	if shared != nil && h2c != nil {
+		defer shared.Close()
 	}
 	srv := &http2.Server{}
 	srv.ServeConn(client, &http2.ServeConnOpts{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-			if host == "" {
-				host = stripPort(req.Host)
+			h := sni
+			if h == "" {
+				h = stripPort(req.Host)
 			}
 			var mock *http.Response
 			if e.d != nil {
-				mock = e.d.OnRequest(host, req)
+				mock = e.d.OnRequest(h, req)
+			}
+			if mock == nil && (isUpgrade(req) || isSSE(req)) {
+				e.h2ProxyStream(w, req, dst, h, hello)
+				return
 			}
 			reqSnip, reqN, reqTr, reqRest := peekBody(req.Body, e.maxBody)
 			req.Body = reqRest
 			if mock != nil {
 				resSnip, resN, resTr, resRest := peekBody(mock.Body, e.maxBody)
 				mock.Body = resRest
-				copyH2Resp(w, mock)
-				e.emit(host, req, mock.StatusCode, reqN, resN, true, reqSnip, resSnip, reqTr, resTr)
+				copyH2Resp(w, mock, false)
+				e.emit(h, req, mock.StatusCode, reqN, resN, true, reqSnip, resSnip, reqTr, resTr)
 				return
 			}
 			var resp *http.Response
+			var rtErr error
 			if h2c != nil {
-				if req.URL != nil {
-					if req.URL.Scheme == "" {
-						req.URL.Scheme = "https"
-					}
-					if req.URL.Host == "" {
-						req.URL.Host = req.Host
-					}
-				}
-				req.RequestURI = ""
-				resp, err = h2c.RoundTrip(req)
+				prepReqURL(req)
+				resp, rtErr = h2c.RoundTrip(req)
 			} else {
-				resp, err = e.writeHTTP(up, req)
+				up, dialErr := e.dialUpstream(dst, h, true, hello)
+				if dialErr != nil {
+					http.Error(w, "upstream dial failed", 502)
+					e.emit(h, req, 502, reqN, 0, false, reqSnip, nil, reqTr, false)
+					return
+				}
+				defer up.Close()
+				resp, rtErr = e.writeHTTP(up, req)
 			}
-			if err != nil || resp == nil {
+			if rtErr != nil || resp == nil {
 				http.Error(w, "upstream dial failed", 502)
-				e.emit(host, req, 502, reqN, 0, false, reqSnip, nil, reqTr, false)
+				e.emit(h, req, 502, reqN, 0, false, reqSnip, nil, reqTr, false)
 				return
 			}
 			defer resp.Body.Close()
+			if isStreamingResp(resp, req) {
+				copyH2Resp(w, resp, true)
+				e.emit(h, req, resp.StatusCode, reqN, 0, false, reqSnip, []byte("stream"), reqTr, false)
+				return
+			}
 			resSnip, peeked, resTr, resRest := peekBody(resp.Body, e.maxBody)
 			resp.Body = resRest
 			resN := resp.ContentLength
 			if resN < 0 {
 				resN = peeked
 			}
-			copyH2Resp(w, resp)
-			e.emit(host, req, resp.StatusCode, reqN, resN, false, reqSnip, resSnip, reqTr, resTr)
+			copyH2Resp(w, resp, false)
+			e.emit(h, req, resp.StatusCode, reqN, resN, false, reqSnip, resSnip, reqTr, resTr)
 		}),
 	})
 }
 
-func copyH2Resp(w http.ResponseWriter, resp *http.Response) {
+func (e *Engine) h2ProxyStream(w http.ResponseWriter, req *http.Request, dst, host string, hello []byte) {
+	up, err := e.dialUpstream(dst, host, true, hello)
+	if err != nil {
+		http.Error(w, "upstream dial failed", 502)
+		return
+	}
+	defer up.Close()
+	resp, err := e.writeHTTP(up, req)
+	if err != nil || resp == nil {
+		http.Error(w, "upstream dial failed", 502)
+		return
+	}
+	defer resp.Body.Close()
+	copyH2Resp(w, resp, true)
+	kind := "stream"
+	if isSSE(req) {
+		kind = "sse"
+	}
+	e.emit(host, req, resp.StatusCode, 0, 0, false, nil, []byte(kind), false, false)
+}
+
+func prepReqURL(req *http.Request) {
+	req.RequestURI = ""
+	if req.URL == nil {
+		return
+	}
+	if req.URL.Scheme == "" {
+		req.URL.Scheme = "https"
+	}
+	if req.URL.Host == "" && req.Host != "" {
+		req.URL.Host = req.Host
+	}
+}
+
+func isStreamingResp(resp *http.Response, req *http.Request) bool {
+	if isSSE(req) || isUpgrade(req) {
+		return true
+	}
+	if resp == nil {
+		return false
+	}
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	return strings.Contains(ct, "text/event-stream") || strings.Contains(ct, "grpc")
+}
+
+func hopHeader(k string) bool {
+	switch strings.ToLower(k) {
+	case "connection", "keep-alive", "proxy-connection", "transfer-encoding",
+		"upgrade", "te", "trailer", "proxy-authenticate", "proxy-authorization":
+		return true
+	default:
+		return false
+	}
+}
+
+func copyH2Resp(w http.ResponseWriter, resp *http.Response, stream bool) {
+	if resp == nil {
+		http.Error(w, "empty response", 502)
+		return
+	}
 	for k, vv := range resp.Header {
-		if strings.EqualFold(k, "Connection") || strings.EqualFold(k, "Transfer-Encoding") {
+		if hopHeader(k) {
 			continue
 		}
 		for _, v := range vv {
 			w.Header().Add(k, v)
 		}
 	}
-	w.WriteHeader(resp.StatusCode)
-	if resp.Body != nil {
-		io.Copy(w, resp.Body)
+	st := resp.StatusCode
+	if st < 100 || st > 599 {
+		st = 502
 	}
+	w.WriteHeader(st)
+	if resp.Body == nil {
+		return
+	}
+	if stream {
+		buf := make([]byte, 32*1024)
+		fl, _ := w.(http.Flusher)
+		for {
+			n, err := resp.Body.Read(buf)
+			if n > 0 {
+				_, _ = w.Write(buf[:n])
+				if fl != nil {
+					fl.Flush()
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		return
+	}
+	_, _ = io.Copy(w, resp.Body)
 }
 
 func negotiatedALPN(c net.Conn) string {
