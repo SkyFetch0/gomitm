@@ -5,7 +5,7 @@ Do not change:
 - `Decider` method set (`OnConnect`, `OnRequest`, `OnFlow`)
 - `Action` (`Passthrough`, `Terminate`)
 - `New`, `Engine.Handle`, `Engine.WithMaxBody`
-- Additive: `Engine.WithKeyLog` (SSLKEYLOGFILE / NSS key log)
+- Additive: `Engine.WithKeyLog`, `Engine.WithUpstreamVerify`
 - `LoadOrCreateCA`, `CertManager.CACertPEM`, `CertManager.ServerConfig`
 - `IsTLS`, `PeekSNI`, `PeekHTTPHost`
 - `Flow` existing fields; adding fields is OK

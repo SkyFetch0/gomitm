@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const maxOriginDump = 512
+
 var (
 	originDumpDir string
 	originDumpMu  sync.Mutex
@@ -25,12 +27,16 @@ func OriginDumpDir() string {
 	return originDumpDir
 }
 
-func dumpOriginChain(host, dst string) {
-	_ = DumpOriginChain(host, dst, false)
+func dumpOriginChain(host, dst string, verify bool) {
+	_ = DumpOriginChain(host, dst, false, verify)
 }
 
 // DumpOriginChain writes originDumpDir/<host>.pem (leaf + intermediates).
-func DumpOriginChain(host, dst string, force bool) error {
+func DumpOriginChain(host, dst string, force bool, verify ...bool) error {
+	v := false
+	if len(verify) > 0 {
+		v = verify[0]
+	}
 	if originDumpDir == "" || host == "" {
 		return fmt.Errorf("origin dump dir or host empty")
 	}
@@ -41,6 +47,9 @@ func DumpOriginChain(host, dst string, force bool) error {
 			return nil
 		}
 	}
+	if len(originDumped) >= maxOriginDump {
+		originDumped = map[string]struct{}{}
+	}
 	originDumpMu.Unlock()
 
 	if dst == "" {
@@ -50,7 +59,7 @@ func DumpOriginChain(host, dst string, force bool) error {
 	if err != nil {
 		return err
 	}
-	cfg := &tls.Config{ServerName: host, InsecureSkipVerify: true}
+	cfg := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12, InsecureSkipVerify: !v}
 	t := tls.Client(raw, cfg)
 	if err := t.Handshake(); err != nil {
 		raw.Close()

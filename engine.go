@@ -12,10 +12,11 @@ import (
 
 // Engine is the MITM dispatch core. It does not know domain state machines.
 type Engine struct {
-	ca      *CertManager
-	d       Decider
-	maxBody int64
-	keyLog  io.Writer
+	ca       *CertManager
+	d        Decider
+	maxBody  int64
+	keyLog   io.Writer
+	verifyUp bool
 }
 
 func New(ca *CertManager, d Decider) *Engine {
@@ -29,6 +30,11 @@ func (e *Engine) WithMaxBody(n int64) *Engine {
 
 func (e *Engine) WithKeyLog(w io.Writer) *Engine {
 	e.keyLog = w
+	return e
+}
+
+func (e *Engine) WithUpstreamVerify(v bool) *Engine {
+	e.verifyUp = v
 	return e
 }
 
@@ -70,7 +76,7 @@ func (e *Engine) Handle(conn net.Conn, host, dst string, isTLS bool) {
 		return
 	}
 	if isTLS {
-		dumpOriginChain(host, dst)
+		dumpOriginChain(host, dst, e.verifyUp)
 		tlsConn := tls.Server(bc, e.serverTLS())
 		if err := tlsConn.Handshake(); err != nil {
 			return
@@ -108,7 +114,11 @@ func (e *Engine) httpLoop(client net.Conn, host, dst string, tlsUp bool) {
 		}
 		var mock *http.Response
 		if e.d != nil {
-			mock = e.d.OnRequest(host, req) // may mutate req (rewrite) then return nil
+			mock = e.d.OnRequest(host, req)
+		}
+		if mock == nil && (isUpgrade(req) || isSSE(req)) {
+			e.forwardRaw(client, br, dst, host, req, tlsUp)
+			return
 		}
 		reqSnip, reqN, reqTr, reqRest := peekBody(req.Body, e.maxBody)
 		req.Body = reqRest
@@ -145,7 +155,7 @@ func (e *Engine) forward(client net.Conn, dst, host string, req *http.Request, t
 	defer raw.Close()
 	var up net.Conn = raw
 	if tlsUp {
-		cfg := &tls.Config{ServerName: host, InsecureSkipVerify: true}
+		cfg := e.upstreamTLS(host)
 		t := tls.Client(raw, cfg)
 		if err := t.Handshake(); err != nil {
 			return 502, 0, 0, nil, false
@@ -163,8 +173,12 @@ func (e *Engine) forward(client net.Conn, dst, host string, req *http.Request, t
 	defer resp.Body.Close()
 	status = resp.StatusCode
 	reqN = req.ContentLength
-	resSnip, resN, resTr, resRest := peekBody(resp.Body, e.maxBody)
+	resSnip, peeked, resTr, resRest := peekBody(resp.Body, e.maxBody)
 	resp.Body = resRest
+	resN = resp.ContentLength
+	if resN < 0 {
+		resN = peeked
+	}
 	_ = resp.Write(client)
 	return status, reqN, resN, resSnip, resTr
 }
@@ -205,4 +219,48 @@ func portFor(tlsUp bool) string {
 		return "443"
 	}
 	return "80"
+}
+
+func (e *Engine) upstreamTLS(host string) *tls.Config {
+	cfg := &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12}
+	if !e.verifyUp {
+		cfg.InsecureSkipVerify = true
+	}
+	return cfg
+}
+
+func isUpgrade(req *http.Request) bool {
+	return strings.EqualFold(req.Header.Get("Upgrade"), "websocket") ||
+		strings.Contains(strings.ToLower(req.Header.Get("Connection")), "upgrade")
+}
+
+func isSSE(req *http.Request) bool {
+	return strings.Contains(strings.ToLower(req.Header.Get("Accept")), "text/event-stream")
+}
+
+func (e *Engine) forwardRaw(client net.Conn, br *bufio.Reader, dst, host string, req *http.Request, tlsUp bool) {
+	if dst == "" {
+		dst = net.JoinHostPort(host, portFor(tlsUp))
+	}
+	raw, err := net.DialTimeout("tcp", dst, 15*time.Second)
+	if err != nil {
+		return
+	}
+	defer raw.Close()
+	var up net.Conn = raw
+	if tlsUp {
+		t := tls.Client(raw, e.upstreamTLS(host))
+		if err := t.Handshake(); err != nil {
+			return
+		}
+		up = t
+	}
+	req.RequestURI = ""
+	if err := req.Write(up); err != nil {
+		return
+	}
+	errc := make(chan struct{}, 2)
+	go func() { io.Copy(up, br); errc <- struct{}{} }()
+	go func() { io.Copy(client, up); errc <- struct{}{} }()
+	<-errc
 }

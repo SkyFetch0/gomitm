@@ -17,12 +17,22 @@ import (
 	"time"
 )
 
+const (
+	maxLeafCache = 256
+	leafTTL      = time.Hour
+)
+
+type leafEntry struct {
+	cert *tls.Certificate
+	at   time.Time
+}
+
 // CertManager holds a root CA and caches leaf certs issued on the fly.
 type CertManager struct {
 	caCert *x509.Certificate
 	caKey  *ecdsa.PrivateKey
 	leafMu sync.Mutex
-	leafs  map[string]*tls.Certificate
+	leafs  map[string]leafEntry
 }
 
 // LoadOrCreateCA loads PEM files from dir or creates a new CA.
@@ -32,7 +42,7 @@ func LoadOrCreateCA(dir string) (*CertManager, error) {
 	}
 	certPath := filepath.Join(dir, "ca-cert.pem")
 	keyPath := filepath.Join(dir, "ca-key.pem")
-	m := &CertManager{leafs: make(map[string]*tls.Certificate)}
+	m := &CertManager{leafs: make(map[string]leafEntry)}
 	if _, err := os.Stat(certPath); err == nil {
 		certPEM, err := os.ReadFile(certPath)
 		if err != nil {
@@ -113,15 +123,18 @@ func (m *CertManager) ServerConfig() *tls.Config {
 			return m.leaf(name)
 		},
 		MinVersion: tls.VersionTLS12,
+		NextProtos: []string{"http/1.1"},
 	}
 }
 
 func (m *CertManager) leaf(host string) (*tls.Certificate, error) {
 	m.leafMu.Lock()
 	defer m.leafMu.Unlock()
-	if c, ok := m.leafs[host]; ok {
-		return c, nil
+	now := time.Now()
+	if e, ok := m.leafs[host]; ok && now.Sub(e.at) < leafTTL {
+		return e.cert, nil
 	}
+	m.evictLocked(now)
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return nil, err
@@ -151,6 +164,28 @@ func (m *CertManager) leaf(host string) (*tls.Certificate, error) {
 		Certificate: [][]byte{der, m.caCert.Raw},
 		PrivateKey:  key,
 	}
-	m.leafs[host] = leaf
+	m.leafs[host] = leafEntry{cert: leaf, at: now}
 	return leaf, nil
+}
+
+func (m *CertManager) evictLocked(now time.Time) {
+	for h, e := range m.leafs {
+		if now.Sub(e.at) >= leafTTL {
+			delete(m.leafs, h)
+		}
+	}
+	for len(m.leafs) >= maxLeafCache {
+		var oldest string
+		var t time.Time
+		first := true
+		for h, e := range m.leafs {
+			if first || e.at.Before(t) {
+				oldest, t, first = h, e.at, false
+			}
+		}
+		if oldest == "" {
+			break
+		}
+		delete(m.leafs, oldest)
+	}
 }

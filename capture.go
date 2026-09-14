@@ -39,5 +39,9 @@ func peekBody(r io.ReadCloser, max int64) (snippet []byte, sizeHint int64, trunc
 	} else {
 		snippet = append([]byte(nil), pref...)
 	}
-	return snippet, int64(len(pref)), trunc, bodyCloser{Reader: io.MultiReader(bytes.NewReader(pref), r), c: r}
+	hint := int64(len(pref))
+	if trunc {
+		hint = max
+	}
+	return snippet, hint, trunc, bodyCloser{Reader: io.MultiReader(bytes.NewReader(pref), r), c: r}
 }
