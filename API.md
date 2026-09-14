@@ -11,4 +11,4 @@ Do not change:
 - `Flow` existing fields; adding fields is OK
 - `DefaultMaxBody`
 
-gomitm must stay stdlib-only and must not import skydst.
+gomitm must not import skydst. Upstream TLS uses utls to parrot the client ClientHello.

@@ -75,16 +75,18 @@ func (e *Engine) Handle(conn net.Conn, host, dst string, isTLS bool) {
 		e.splice(bc, dst)
 		return
 	}
+	var hello []byte
 	if isTLS {
+		hello = peekTLSRecord(br)
 		dumpOriginChain(host, dst, e.verifyUp)
 		tlsConn := tls.Server(bc, e.serverTLS())
 		if err := tlsConn.Handshake(); err != nil {
 			return
 		}
-		e.httpLoop(tlsConn, host, dst, true)
+		e.httpLoop(tlsConn, host, dst, true, hello)
 		return
 	}
-	e.httpLoop(bc, host, dst, false)
+	e.httpLoop(bc, host, dst, false, nil)
 }
 
 func (e *Engine) splice(client net.Conn, dst string) {
@@ -102,7 +104,7 @@ func (e *Engine) splice(client net.Conn, dst string) {
 	<-errc
 }
 
-func (e *Engine) httpLoop(client net.Conn, host, dst string, tlsUp bool) {
+func (e *Engine) httpLoop(client net.Conn, host, dst string, tlsUp bool, hello []byte) {
 	br := bufio.NewReader(client)
 	for {
 		req, err := http.ReadRequest(br)
@@ -117,7 +119,7 @@ func (e *Engine) httpLoop(client net.Conn, host, dst string, tlsUp bool) {
 			mock = e.d.OnRequest(host, req)
 		}
 		if mock == nil && (isUpgrade(req) || isSSE(req)) {
-			e.forwardRaw(client, br, dst, host, req, tlsUp)
+			e.forwardRaw(client, br, dst, host, req, tlsUp, hello)
 			return
 		}
 		reqSnip, reqN, reqTr, reqRest := peekBody(req.Body, e.maxBody)
@@ -133,7 +135,7 @@ func (e *Engine) httpLoop(client net.Conn, host, dst string, tlsUp bool) {
 			e.emit(host, req, mock.StatusCode, reqN, resN, true, reqSnip, resSnip, reqTr, resTr)
 			continue
 		}
-		status, reqN2, resN, resSnip, resTr := e.forward(client, dst, host, req, tlsUp)
+		status, reqN2, resN, resSnip, resTr := e.forward(client, dst, host, req, tlsUp, hello)
 		if reqN2 > reqN {
 			reqN = reqN2
 		}
@@ -141,32 +143,19 @@ func (e *Engine) httpLoop(client net.Conn, host, dst string, tlsUp bool) {
 	}
 }
 
-func (e *Engine) forward(client net.Conn, dst, host string, req *http.Request, tlsUp bool) (status int, reqN, resN int64, resSnip []byte, resTr bool) {
+func (e *Engine) forward(client net.Conn, dst, host string, req *http.Request, tlsUp bool, hello []byte) (status int, reqN, resN int64, resSnip []byte, resTr bool) {
 	if dst == "" {
 		dst = net.JoinHostPort(host, portFor(tlsUp))
 	}
-	raw, err := net.DialTimeout("tcp", dst, 15*time.Second)
+	up, err := e.dialUpstream(dst, host, tlsUp, hello)
 	if err != nil {
 		msg := "upstream dial failed"
 		resp := &http.Response{StatusCode: 502, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(msg))}
 		_ = resp.Write(client)
 		return 502, 0, int64(len(msg)), []byte(msg), false
 	}
-	defer raw.Close()
-	var up net.Conn = raw
-	if tlsUp {
-		cfg := e.upstreamTLS(host)
-		t := tls.Client(raw, cfg)
-		if err := t.Handshake(); err != nil {
-			return 502, 0, 0, nil, false
-		}
-		up = t
-	}
-	req.RequestURI = ""
-	if err := req.Write(up); err != nil {
-		return 502, 0, 0, nil, false
-	}
-	resp, err := http.ReadResponse(bufio.NewReader(up), req)
+	defer up.Close()
+	resp, err := e.writeHTTP(up, req)
 	if err != nil {
 		return 502, 0, 0, nil, false
 	}
@@ -238,23 +227,15 @@ func isSSE(req *http.Request) bool {
 	return strings.Contains(strings.ToLower(req.Header.Get("Accept")), "text/event-stream")
 }
 
-func (e *Engine) forwardRaw(client net.Conn, br *bufio.Reader, dst, host string, req *http.Request, tlsUp bool) {
+func (e *Engine) forwardRaw(client net.Conn, br *bufio.Reader, dst, host string, req *http.Request, tlsUp bool, hello []byte) {
 	if dst == "" {
 		dst = net.JoinHostPort(host, portFor(tlsUp))
 	}
-	raw, err := net.DialTimeout("tcp", dst, 15*time.Second)
+	up, err := e.dialUpstream(dst, host, tlsUp, hello)
 	if err != nil {
 		return
 	}
-	defer raw.Close()
-	var up net.Conn = raw
-	if tlsUp {
-		t := tls.Client(raw, e.upstreamTLS(host))
-		if err := t.Handshake(); err != nil {
-			return
-		}
-		up = t
-	}
+	defer up.Close()
 	req.RequestURI = ""
 	if err := req.Write(up); err != nil {
 		return

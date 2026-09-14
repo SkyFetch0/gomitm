@@ -6,7 +6,7 @@ Does **not** import [skydst](https://github.com/SkyFetch0/skydst). You pass any 
 
 Unlike an HTTP CONNECT proxy, this is the **transparent** half: the socket is already redirected; gomitm either splices or decrypts.
 
-**License:** MIT · **Go:** 1.22+ · **stdlib only**
+**License:** MIT · **Go:** 1.22+
 
 ```bash
 go get github.com/SkyFetch0/gomitm@v0.1.0
