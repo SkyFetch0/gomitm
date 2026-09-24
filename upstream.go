@@ -80,9 +80,14 @@ func (e *Engine) utlsHandshake(raw net.Conn, host string, hello []byte) (net.Con
 	return u, nil
 }
 
+// useH2 is true only for negotiated ALPN "h2"; empty and http/1.1 stay HTTP/1.1.
+func useH2(alpn string) bool {
+	return alpn == "h2"
+}
+
 func (e *Engine) writeHTTP(up net.Conn, req *http.Request) (*http.Response, error) {
 	prepReqURL(req)
-	if negotiatedALPN(up) == "h2" {
+	if useH2(negotiatedALPN(up)) {
 		tr := &http2.Transport{}
 		cc, err := tr.NewClientConn(up)
 		if err != nil {
@@ -121,7 +126,7 @@ func (e *Engine) h2Server(client *tls.Conn, sni, dst string, hello []byte) {
 	}
 	shared, err := e.dialUpstream(dst, sni, true, hello)
 	var h2c *http2.ClientConn
-	if err == nil && negotiatedALPN(shared) == "h2" {
+	if err == nil && useH2(negotiatedALPN(shared)) {
 		tr := &http2.Transport{}
 		h2c, err = tr.NewClientConn(shared)
 		if err != nil {
